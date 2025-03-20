@@ -51,10 +51,19 @@ class SessionManager:
             
         for filename in os.listdir(self.sessions_dir):
             if filename.endswith('.json'):
+                # Skip deleted facts files which contain a list instead of a session dictionary
+                if filename.endswith('_deleted.json'):
+                    continue
+                    
                 session_id = filename.replace('.json', '')
                 try:
                     with open(os.path.join(self.sessions_dir, filename), 'r') as f:
                         data = json.load(f)
+                        
+                    # Check if it's a deleted facts file (list)
+                    if isinstance(data, list):
+                        # Skip this file or handle it specially
+                        continue
                         
                     # Extract basic metadata
                     sessions[session_id] = {
@@ -72,6 +81,12 @@ class SessionManager:
         """Load a research session by ID."""
         if not session_id:
             print("Please specify a session ID.")
+            return False
+            
+        # Check if the ID is a deleted facts file
+        if session_id.endswith("_deleted"):
+            print(f"'{session_id}' is a deleted facts archive, not a valid session.")
+            print("Please use a regular session ID instead.")
             return False
             
         session_file = os.path.join(self.sessions_dir, f"{session_id}.json")
