@@ -579,11 +579,8 @@ Example response format:
             response = self._openai_client.chat.completions.create(
                 model=R1_CONFIG["model_id"],
                 messages=[
-                    {"role": "system", "content": "You are a scientific term analyzer. Extract and classify terms from queries."},
                     {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.1
+                ]
             )
             
             filtered_facts = []
