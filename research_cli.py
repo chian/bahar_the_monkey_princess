@@ -194,6 +194,7 @@ Provide accurate, scientific responses based on the research data.
             # Add to messages list
             messages.append({"role": "user", "content": user_input})
             
+            print("Searching for relevant research context...")
             # Retrieve relevant facts for context
             context = self._get_relevant_context(user_input)
             
@@ -204,6 +205,7 @@ Provide accurate, scientific responses based on the research data.
             
             # Generate response using OpenAI API
             try:
+                print("Generating response...")
                 from query_atom_smallworld import DEFAULT_CONFIG
                 import openai
                 
@@ -218,6 +220,7 @@ Provide accurate, scientific responses based on the research data.
                 # Display the response
                 print(f"Assistant: {assistant_response}")
                 
+                print("Saving chat history...")
                 # Save to history
                 if self.databases:
                     cursor = self.databases['relational'].cursor()
