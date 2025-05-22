@@ -25,7 +25,7 @@ from firecrawl import FirecrawlApp
 DEFAULT_CONFIG = {
     "api_key": os.getenv('OPENAI_API_KEY'),
     "endpoint": "https://api.openai.com/v1",
-    "model_id": "o3-mini",
+    "model_id": "o4-mini",
     "tools": []
 }
 

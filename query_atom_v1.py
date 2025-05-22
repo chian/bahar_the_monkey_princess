@@ -21,7 +21,7 @@ from firecrawl import FirecrawlApp
 DEFAULT_CONFIG = {
     "api_key": os.getenv('OPENAI_API_KEY'),
     "endpoint": "https://api.openai.com/v1",
-    "model_id": "o3-mini",
+    "model_id": "o4-mini",
     "tools": []
 }
 
@@ -41,7 +41,7 @@ FIRECRAWL_CONFIG = {
 AGENT_CONFIGS = {
     "supervisor": {
         **DEFAULT_CONFIG,
-        "model_id": "gpt-4.5-preview",
+        "model_id": "gpt-4.1-nano",
     },
     "query_generation": {  # Instead of "generation"
         **DEFAULT_CONFIG,
