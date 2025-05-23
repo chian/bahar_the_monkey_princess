@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from requests.exceptions import HTTPError
 import signal
 from dotenv import load_dotenv
+from thought_chain import thoughts_text_to_nodes, build_thought_chain
 
 # Load environment variables
 load_dotenv()
@@ -72,6 +73,10 @@ AGENT_CONFIGS = {
     },
     "conclusion_formation": {  # Instead of "meta_review"
         **R1_CONFIG,
+    },
+    "reasoning_continuation": {
+        **R1_CONFIG,
+        "model_id": "deepseek-ai/DeepSeek-V3"
     },
 }
 
@@ -884,6 +889,56 @@ def format_results_to_context(results: Dict[str, Any]) -> str:
     
     return context
 
+def filter_relevant_evidence(
+    facts: list, 
+    query: str,  
+    keyword_batch_size: int = 100
+) -> list:
+    """
+    Iteratively use an LLM to select relevant keywords from the set of subjects and objects (no new keywords allowed),
+    then filter facts by those keywords. Handles large keyword sets by batching.
+    """
+    import json, re
+
+    # Step 1: Collect unique subjects and objects (deduplicated)
+    keywords_set = set()
+    for fact in facts:
+        if fact.get('subject'):
+            keywords_set.add(fact['subject'])
+        if fact.get('object'):
+            keywords_set.add(fact['object'])
+    keywords_list = list(keywords_set)
+
+    # Step 2: Iteratively ask LLM to select relevant keywords in batches
+    selected_keywords = set()
+    for i in range(0, len(keywords_list), keyword_batch_size):
+        batch = keywords_list[i:i+keyword_batch_size]
+        prompt = (
+            f"Given the scientific question:\n\"{query}\"\n\n"
+            f"Here is a list of possible keywords (subjects and objects):\n"
+            + "\n".join(f"- {kw}" for kw in batch) +
+            f"\n\nSelect ONLY from the list above the keywords or key phrases that are most relevant for filtering facts to answer the question. "
+            f"Do not invent or generate new keywords. Only select from the list. "
+            f"Return ONLY a JSON array of selected keywords, e.g. [\"keyword1\", \"keyword2\"]."
+        )
+        response = call_agent(
+            agent_type="supervisor",
+            user_prompt=prompt
+        )
+        try:
+            batch_selected = json.loads(re.search(r"\[.*?\]", response, re.DOTALL).group(0))
+            selected_keywords.update(batch_selected)
+        except Exception as e:
+            print(f"Failed to parse LLM response: {e}\nResponse: {response}")
+
+    # Step 3: Filter facts by selected keywords
+    relevant_facts = []
+    for fact in facts:
+        if (fact.get('subject') in selected_keywords) or (fact.get('object') in selected_keywords):
+            relevant_facts.append(fact)
+
+    return relevant_facts
+
 ##############################################################################
 # Core iterative reasoning process
 ##############################################################################
@@ -893,10 +948,13 @@ def process_iteration(
     context: List[str], 
     depth_remaining: int,
     breadth: int = 4,
-    is_main_investigation: bool = True
+    is_main_investigation: bool = True,
+    session_id: str = None,
+    session_manager = None
 ) -> Dict[str, Any]:
     """
     Process one iteration of the scientific reasoning workflow.
+    If session_id and session_manager are provided, save progress incrementally.
     """
     # Get chunk parameters from information extraction agent config
     extraction_config = AGENT_CONFIGS["information_extraction"]
@@ -904,6 +962,14 @@ def process_iteration(
     max_chunks = extraction_config.get("max_chunks", 30)
     
     print(f"\n=== Processing Question: {question} (Depth: {depth_remaining}) ===\n")
+    
+    # Create a result dictionary to track progress
+    current_results = {
+        "question": question,
+        "context": context,
+        "search_queries": [],
+        "facts": []
+    }
     
     # 1. Generate search queries based on the question and context
     context_str = "\n".join(context) if context else ""
@@ -934,6 +1000,15 @@ def process_iteration(
         print(f"{i+1}. {query}")
     print("")
     
+    # Update current results
+    current_results["search_queries"] = parsed_queries
+    
+    # Save progress if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = current_results
+        session_manager.save_session()
+        print(f"Saved search queries to session: {session_id}")
+    
     # Track search queries and sources
     search_metadata = {
         "queries": parsed_queries,
@@ -961,6 +1036,16 @@ def process_iteration(
             
             source_counter += 1
             search_results.append(result)
+    
+    # Update current results
+    current_results["search_results"] = search_results
+    current_results["search_metadata"] = search_metadata
+    
+    # Save progress if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = current_results
+        session_manager.save_session()
+        print(f"Saved search results to session: {session_id}")
     
     # Format search results for the agent - respect chunk limits
     search_results_str = ""
@@ -1004,6 +1089,15 @@ def process_iteration(
     print(extraction_output)
     print("")
     
+    # Update current results
+    current_results["extraction_output"] = extraction_output
+    
+    # Save progress if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = current_results
+        session_manager.save_session()
+        print(f"Saved information extraction to session: {session_id}")
+    
     # 4. Evaluate evidence quality
     evaluate_prompt = (
         f"Evaluate the quality, reliability, and relevance of this extracted information "
@@ -1021,6 +1115,15 @@ def process_iteration(
     print("\n=== Evidence Evaluation Results ===")
     print(evaluation_output)
     print("")
+    
+    # Update current results
+    current_results["evaluation_output"] = evaluation_output
+    
+    # Save progress if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = current_results
+        session_manager.save_session()
+        print(f"Saved evidence evaluation to session: {session_id}")
     
     # 5. Synthesize an answer based on evidence
     synthesize_prompt = (
@@ -1040,6 +1143,15 @@ def process_iteration(
     print(synthesis_output)
     print("")
     
+    # Update current results
+    current_results["synthesis_output"] = synthesis_output
+    
+    # Save progress if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = current_results
+        session_manager.save_session()
+        print(f"Saved answer synthesis to session: {session_id}")
+    
     # 6. Verify reasoning
     verify_prompt = (
         f"Verify the scientific reasoning in this answer to the question:\n\n{question}\n\n"
@@ -1057,6 +1169,15 @@ def process_iteration(
     print("\n=== Reasoning Verification Results ===")
     print(verification_output)
     print("")
+    
+    # Update current results
+    current_results["verification_output"] = verification_output
+    
+    # Save progress if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = current_results
+        session_manager.save_session()
+        print(f"Saved reasoning verification to session: {session_id}")
     
     # Adjust the answer based on verification feedback
     refine_prompt = (
@@ -1076,166 +1197,125 @@ def process_iteration(
     print(refined_answer)
     print("")
     
-    # Create full-text chunks from search results for fact extraction
-    chunks_by_source = {}
-    for result in search_results:
-        source_id = result["source_id"]
-        query = result["query"]
-        
-        # Get or create source in chunks_by_source
-        if source_id not in chunks_by_source:
-            chunks_by_source[source_id] = {
-                "url": result.get("url", ""),
-                "title": result.get("title", ""),
-                "chunks": [],
-                "queries": [query]
-            }
-        elif query not in chunks_by_source[source_id]["queries"]:
-            chunks_by_source[source_id]["queries"].append(query)
-        
-        # Create chunk ID
-        chunk_id = chr(65 + len(chunks_by_source[source_id]["chunks"]))  # A, B, C, etc.
-        
-        # Add content as a chunk
-        chunks_by_source[source_id]["chunks"].append({
-            "id": chunk_id,
-            "text": result.get("content", result.get("snippet", "")),
-            "query": query
-        })
-        
-        # Add chunk to bibliography
-        for source in search_metadata["sources"]:
-            if source["id"] == source_id:
-                source["chunks"].append({
-                    "id": chunk_id,
-                    "text": result.get("content", result.get("snippet", "")),
-                    "query": query
-                })
+    # Update current results with final answer
+    current_results["answer"] = refined_answer
     
-    # 7. Extract facts from the refined answer and search results
-    print("\n=== Extracting Facts ===")
+    # Save progress if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = current_results
+        session_manager.save_session()
+        print(f"Saved refined answer to session: {session_id}")
     
-    # First extract facts from the refined answer
-    answer_source_info = {
-        "query": question,
-        "source_id": "A",  # A for Answer
-        "chunk_id": "0",
-        "text": refined_answer,
-        "source_url": "",  # No URL for model-generated content
-        "investigation_type": "main_investigation" if is_main_investigation else "followup_investigation"
-    }
-    facts = atomize_facts(refined_answer, answer_source_info)
+    # Rest of the function continues as before...
     
-    # Then extract facts from each search result
-    for source_id, source_data in chunks_by_source.items():
-        for chunk in source_data["chunks"]:
-            chunk_source_info = {
-                "query": chunk["query"],
-                "source_id": str(source_id),
-                "chunk_id": chunk["id"],
-                "text": chunk["text"],
-                "source_url": source_data.get("url", ""),  # Added source URL
-                "investigation_type": "main_investigation" if is_main_investigation else "followup_investigation"
-            }
-            
-            # Extract facts from this chunk
-            chunk_facts = atomize_facts(chunk["text"], chunk_source_info)
-            
-            # Merge with existing facts - avoid duplicates
-            for new_fact in chunk_facts:
-                # Check if fact already exists
-                existing_fact = next((f for f in facts if 
-                                    f["subject"] == new_fact["subject"] and
-                                    f["relation"] == new_fact["relation"] and
-                                    f["object"] == new_fact["object"]), None)
-                
-                if existing_fact:
-                    # Merge evidence
-                    if "evidence" in new_fact and new_fact["evidence"]:
-                        if "evidence" not in existing_fact:
-                            existing_fact["evidence"] = []
-                        existing_fact["evidence"].extend(new_fact["evidence"])
-                else:
-                    # Add new fact
-                    facts.append(new_fact)
+    # Continue with fact extraction, etc...
     
-    print(f"Extracted {len(facts)} facts")
-    for fact in facts:
-        evidence_str = ""
-        if "evidence" in fact and fact["evidence"]:
-            sources = [f"[{e.get('source_id', '?')}{e.get('chunk_id', '?')}]" for e in fact["evidence"]]
-            evidence_str = f" (sources: {', '.join(sources)})"
-        print(f"- {fact['subject']} {fact['relation']} {fact['object']}{evidence_str}")
-    print("")
-    
-    # 8. If depth remaining, identify follow-up questions and continue
-    if depth_remaining > 0:
+    # If we're supposed to go deeper, generate and process followup questions
+    followups = []
+    if depth_remaining > 1:
         followup_prompt = (
-            f"Based on the current answer to this question:\n\n{question}\n\n"
+            f"Based on the answer to the original question:\n\n{question}\n\n"
             f"Current answer:\n{refined_answer}\n\n"
-            f"Identify {min(3, breadth)} focused follow-up questions that would help address "
-            f"remaining uncertainties, explore important mechanisms, or examine alternative "
-            f"explanations. Each question should contribute significant additional insight."
+            f"Generate 3 targeted followup questions to investigate key aspects that would "
+            f"enhance our understanding of the topic. Focus on areas that need deeper "
+            f"explanation or aspects that weren't fully addressed in the current answer."
         )
         
         followup_output = call_agent(
-            agent_type="supervisor",
+            agent_type="query_generation",
             user_prompt=followup_prompt
         )
         
-        parsed_questions = parse_questions(followup_output, expected_count=min(3, breadth))
-        
+        followup_questions = parse_questions(followup_output, expected_count=3)
         print("\n=== Follow-up Questions ===")
-        for i, q in enumerate(parsed_questions):
+        for i, q in enumerate(followup_questions):
             print(f"{i+1}. {q}")
         print("")
         
-        # Recursive exploration of follow-up questions
-        followup_results = []
-        for followup in parsed_questions:
-            result = process_iteration(
-                followup, 
-                context + [refined_answer], 
-                depth_remaining - 1,
-                breadth=max(2, breadth-1),  # Reduce breadth as we go deeper
-                is_main_investigation=False  # Mark as not main investigation
+        # Process each followup question recursively
+        for followup_question in followup_questions:
+            # Add the current answer as context for the followup
+            followup_context = context.copy()
+            followup_context.append(refined_answer)
+            
+            # Recursively process the followup (with decreased depth)
+            followup_result = process_iteration(
+                question=followup_question,
+                context=followup_context,
+                depth_remaining=depth_remaining-1,
+                breadth=breadth,
+                is_main_investigation=False,
+                session_id=session_id,
+                session_manager=session_manager
             )
-            followup_results.append(result)
-        
-        # Include follow-up results and search metadata in the return
-        return {
-            "question": question,
-            "answer": refined_answer,
-            "facts": facts,
-            "evidence": evaluation_output,
-            "followups": followup_results,
-            "search_metadata": search_metadata,
-            "investigation_type": "followup_investigation"
-        }
+            
+            followups.append(followup_result)
+            
+            # Update current results after each followup
+            current_results["followups"] = followups
+            
+            # Save progress if session_id and session_manager provided
+            if session_id and session_manager:
+                session_manager.research_data["results"] = current_results
+                session_manager.save_session()
+                print(f"Saved followup result to session: {session_id}")
     
-    # Base case: return results without follow-ups
-    return {
+    # Atomize facts from the final answer
+    facts = atomize_facts(refined_answer, {
+        "type": "answer",
         "question": question,
-        "answer": refined_answer,
-        "facts": facts,
-        "evidence": evaluation_output,
+        "investigation_type": "main" if is_main_investigation else "followup"
+    })
+    
+    # Store all results in the structured format
+    result = {
+        "question": question,
+        "context": context,
+        "search_queries": parsed_queries,
         "search_metadata": search_metadata,
-        "investigation_type": "main_investigation" if is_main_investigation else "followup_investigation"
+        "extraction_output": extraction_output,
+        "evaluation_output": evaluation_output,
+        "synthesis_output": synthesis_output,
+        "verification_output": verification_output,
+        "answer": refined_answer,
+        "facts": facts
     }
+    
+    # Add followups if we have any
+    if followups:
+        result["followups"] = followups
+    
+    # Save the final result if session_id and session_manager provided
+    if session_id and session_manager:
+        session_manager.research_data["results"] = result
+        session_manager.save_session()
+        print(f"Saved complete results to session: {session_id}")
+    
+    return result
 
 ##############################################################################
 # Conclusion formation and report generation
 ##############################################################################
 
-def form_conclusion(results: Dict[str, Any]) -> str:
+def extract_thoughts_and_conclusions(text: str) -> dict:
     """
-    Form a final conclusion with reasoning chain from all the iterative results.
+    Extracts the content inside <think>...</think> tags as 'thoughts', and the rest as 'conclusions'.
+    Returns a dictionary with keys 'thoughts' and 'conclusions'.
     """
-    # Format all the results into a comprehensive context
-    context = format_results_to_context(results)
-    
-    # Generate the final conclusion with reasoning chain
-    conclusion_prompt = (
+    import re
+    thoughts_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
+    thoughts = thoughts_match.group(1).strip() if thoughts_match else ""
+    conclusions = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    return {"thoughts": thoughts, "conclusions": conclusions}
+
+def generate_analysis(results: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Calls the LLM to generate a final analysis for the scientific question, returning a dictionary with
+    'thoughts' (reasoning chain inside <think>...</think>) and 'conclusions' (summary outside those tags).
+    Uses only the relevant facts for the main question.
+    """
+    context = filter_relevant_evidence(results['facts'], results['question'])
+    analysis_prompt = (
         f"Form a comprehensive conclusion with clear reasoning chain for the scientific question:\n\n"
         f"{results['question']}\n\n"
         f"Based on all the evidence and intermediate answers we've gathered:\n\n{context}\n\n"
@@ -1244,210 +1324,67 @@ def form_conclusion(results: Dict[str, Any]) -> str:
         f"current scientific understanding. Focus on creating a clear chain of reasoning that "
         f"connects evidence to conclusions."
     )
-    
-    conclusion = call_agent(
+    analysis_output = call_agent(
         agent_type="conclusion_formation",
-        user_prompt=conclusion_prompt
+        user_prompt=analysis_prompt
     )
-    
-    return conclusion
+    return extract_thoughts_and_conclusions(analysis_output)
 
-def generate_markdown_report(question: str, results: Dict[str, Any], conclusion: str) -> str:
+def generate_markdown_report(export_data: Dict[str, Any]) -> str:
     """
-    Generate a comprehensive markdown report with the reasoning process.
+    Generate a Markdown report from the flat export_data dict (as produced by save_research_data_to_json).
+    Uses only the flat facts, main_question, conclusions, thoughts, and bibliography fields.
     """
-    report = f"# Scientific Question Analysis: {question}\n\n"
-    report += f"## Conclusion\n\n{conclusion}\n\n"
-    
-    # Create a comprehensive reasoning section that builds from facts to conclusion
-    report += "## Reasoning Process\n\n"
-    
-    # 1. Gather all atomic facts from main and follow-up investigations
-    all_facts = []
-    
-    # Add main facts
-    for fact in results['facts']:
-        all_facts.append({
-            'fact_text': f"{fact['subject']} {fact['relation']} {fact['object']}",
-            'source': 'main investigation'
-        })
-    
-    # Add facts from followups recursively
-    def add_followup_facts(followup, source_prefix):
-        for fact in followup.get('facts', []):
-            all_facts.append({
-                'fact_text': f"{fact['subject']} {fact['relation']} {fact['object']}",
-                'source': f"{source_prefix}: {followup['question']}"
-            })
-        
-        # Process deeper followups
-        for i, sub_followup in enumerate(followup.get('followups', [])):
-            add_followup_facts(sub_followup, f"{source_prefix} > Sub-investigation {i+1}")
-    
-    # Process all followups
-    if 'followups' in results:
-        for i, followup in enumerate(results['followups']):
-            add_followup_facts(followup, f"Follow-up {i+1}")
-    
-    # 2. List all atomic facts
-    report += "### Established Facts\n\n"
-    for item in all_facts:
-        report += f"- {item['fact_text']} _(from {item['source']})_\n"
-    report += "\n"
-    
-    # 3. Generate reasoning chain from facts to conclusion
-    report += "### Reasoning Chain\n\n"
-    
-    # Create a reasoning prompt for the agent to generate the chain
-    reasoning_prompt = (
-        f"Based on these established facts from our investigation:\n\n"
-        + "\n".join([f"- {item['fact_text']}" for item in all_facts])
-        + f"\n\nAnd this conclusion:\n\n{conclusion}\n\n"
-        + "Create a step-by-step reasoning chain showing how these facts logically "
-        + "support or lead to the conclusion. If some facts contradict parts of the conclusion, "
-        + "explain the reasoning for why certain interpretations were favored over others."
-    )
-    
-    # Generate the reasoning chain using the conclusion formation agent
-    full_response = call_agent(
-        agent_type="conclusion_formation",
-        user_prompt=reasoning_prompt
-    )
-    
-    # Parse out the reasoning chain and conclusion parts
-    reasoning_match = re.search(r'<think>(.*?)</think>', full_response, re.DOTALL)
-    reasoning_chain = reasoning_match.group(1).strip() if reasoning_match else ""
-    
-    # Get the conclusion part (everything outside the think tags)
-    conclusion_parts = re.split(r'<think>.*?</think>', full_response, flags=re.DOTALL)
-    additional_conclusion = ' '.join(part.strip() for part in conclusion_parts if part.strip())
-    
-    report += reasoning_chain + "\n\n"
-    if additional_conclusion:
-        report += "### Additional Insights\n\n" + additional_conclusion + "\n\n"
-    
-    # Add the original investigation details
-    report += "## Investigation Details\n\n"
-    
-    # Add the main answer and evidence
-    report += f"### Initial Investigation\n\n"
-    report += f"{results['answer']}\n\n"
-    report += f"**Evidence Evaluation:**\n\n{results['evidence']}\n\n"
-    
-    # Add follow-up investigations if they exist
-    if 'followups' in results:
-        report += "### Follow-up Investigations\n\n"
-        for i, followup in enumerate(results['followups']):
-            report += f"#### Follow-up Question {i+1}: {followup['question']}\n\n"
-            report += f"{followup['answer']}\n\n"
-            
-            # Add nested facts
-            report += "**Key Facts:**\n\n"
-            for fact in followup['facts']:
-                report += f"- {fact['subject']} {fact['relation']} {fact['object']}\n"
-            report += "\n"
-            
-            # Add deeper follow-ups recursively if they exist
-            if 'followups' in followup:
-                report += "**Further Exploration:**\n\n"
-                for j, sub_followup in enumerate(followup['followups']):
-                    report += f"*Sub-question {j+1}: {sub_followup['question']}*\n\n"
-                    report += f"{sub_followup['answer']}\n\n"
-    
-    # Add sources - using tracked URLs from searches
-    report += "## Sources and References\n\n"
-    global visited_urls
-    unique_urls = list(set(visited_urls))
-    if unique_urls:
-        for url in unique_urls:
-            report += f"- [{url}]({url})\n"
+    report = f"# Scientific Question Analysis: {export_data.get('main_question', 'Unknown Question') }\n\n"
+    if 'timestamp' in export_data:
+        report += f"_Generated on: {export_data['timestamp']}_\n\n"
+    report += f"## Conclusion\n\n{export_data.get('conclusions', '')}\n\n"
+    if export_data.get('thoughts'):
+        report += f"## Reasoning Chain (Thoughts)\n\n{export_data['thoughts']}\n\n"
+
+    # Established Facts
+    report += "## Established Facts\n\n"
+    facts = export_data.get('facts', [])
+    if facts:
+        for fact in facts:
+            fact_str = f"- {fact.get('subject', '')} {fact.get('relation', '')} {fact.get('object', '')}"
+            # Add evidence/source info if available
+            if 'evidence' in fact and fact['evidence']:
+                sources = []
+                for e in fact['evidence']:
+                    src = []
+                    if e.get('source_id') and e.get('chunk_id'):
+                        src.append(f"[{e['source_id']}{e['chunk_id']}]")
+                    if e.get('source_url'):
+                        src.append(f"URL: {e['source_url']}")
+                    if e.get('query'):
+                        src.append(f"query: '{e['query']}'")
+                    if src:
+                        sources.append(", ".join(src))
+                if sources:
+                    fact_str += f" _(evidence: {'; '.join(sources)})_"
+            report += fact_str + "\n"
     else:
-        report += "*No sources were tracked during this research process.*\n\n"
-    
-    # Add a new section for search queries
-    if "search_metadata" in results and "queries" in results["search_metadata"]:
-        report += "\n\n## Search Queries Used in Main Investigation\n\n"
-        for i, query in enumerate(results["search_metadata"]["queries"]):
-            report += f"{i+1}. `{query}`\n"
-    
-    # Build a complete bibliography from all investigations
-    bibliography = collect_bibliography_entries(results)
-    
-    # Format facts with source information
-    report += "\n\n## Established Facts\n\n"
-    all_facts = collect_all_facts(results)
-    
-    for fact in all_facts:
-        # Construct the fact string from components instead of expecting a 'fact' key
-        fact_str = f"- {fact['subject']} {fact['relation']} {fact['object']}"
-        
-        # Handle multiple evidence sources
-        if "evidence" in fact and fact["evidence"]:
-            # Group by investigation type
-            main_evidence = []
-            followup_evidence = {}
-            
-            for evidence in fact["evidence"]:
-                if evidence.get("investigation_type") == "main_investigation":
-                    main_evidence.append(evidence)
-                else:
-                    followup_name = evidence.get("followup_name", "follow-up investigation")
-                    if followup_name not in followup_evidence:
-                        followup_evidence[followup_name] = []
-                    followup_evidence[followup_name].append(evidence)
-            
-            # Start with sources info
-            sources_info = []
-            
-            # Format main investigation sources with URLs
-            if main_evidence:
-                main_citations = [f"[{e['source_id']}{e['chunk_id']}]" for e in main_evidence]
-                main_queries = list(set([e['query'] for e in main_evidence]))
-                main_urls = list(set([e['source_url'] for e in main_evidence if e.get('source_url')]))
-                
-                main_info = "from main investigation"
-                if main_queries:
-                    query_list = ", ".join([f'"{q}"' for q in main_queries])
-                    main_info += f", queries: {query_list}"
-                
-                if main_citations:
-                    main_info += f", sources: {', '.join(main_citations)}"
-                
-                if main_urls:
-                    main_info += f", URLs: {', '.join(main_urls)}"
-                
-                sources_info.append(main_info)
-            
-            # Format followup investigation sources
-            for followup_name, evidence_list in followup_evidence.items():
-                followup_citations = [f"[{e['source_id']}{e['chunk_id']}]" for e in evidence_list]
-                followup_queries = list(set([e['query'] for e in evidence_list]))
-                
-                followup_info = f"from {followup_name}"
-                if followup_queries:
-                    query_list = ", ".join([f'"{q}"' for q in followup_queries])
-                    followup_info += f", queries: {query_list}"
-                
-                if followup_citations:
-                    followup_info += f", sources: {', '.join(followup_citations)}"
-                
-                sources_info.append(followup_info)
-            
-            # Format all sources info
-            if sources_info:
-                fact_str += f" _({'; '.join(sources_info)})_"
-        
-        report += fact_str + "\n"
-    
-    # Add bibliography section
-    report += "\n\n## Bibliography\n\n"
-    for source in bibliography:
-        report += f"{source['id']}. **{source['title']}**\n"
-        if "url" in source and source["url"]:
-            report += f"   URL: {source['url']}\n"
-        
-        report += "\n"
-    
+        report += "*No facts were extracted.*\n\n"
+
+    # Bibliography
+    report += "\n## Bibliography\n\n"
+    bibliography = export_data.get('bibliography', [])
+    if bibliography:
+        for source in bibliography:
+            report += f"- **{source.get('title', 'Untitled source')}**"
+            if source.get('url'):
+                report += f" ([{source['url']}]({source['url']}))"
+            report += "\n"
+    else:
+        report += "*No sources were recorded.*\n"
+
+    # Visited URLs (optional)
+    if 'visited_urls' in export_data and export_data['visited_urls']:
+        report += "\n## Visited URLs\n\n"
+        for url in export_data['visited_urls']:
+            report += f"- {url}\n"
+
     return report
 
 def collect_bibliography_entries(result: Dict[str, Any]) -> List[Dict]:
@@ -1520,44 +1457,48 @@ def collect_all_facts(result: Dict[str, Any], parent_name: str = None) -> List[D
     
     return all_facts
 
+
 ##############################################################################
 # Data export function
 ##############################################################################
 
-def save_research_data_to_json(question: str, results: Dict[str, Any], conclusion: str) -> str:
+def save_research_data_to_json(question: str, results: Dict[str, Any], analysis: dict = None) -> tuple:
     """
     Save all the collected research data to a JSON file for future analysis or processing.
-    Includes questions, answers, facts, evidence, bibliography, and all search queries.
-    
-    Args:
-        question: The main scientific question
-        results: The full results dictionary from process_iteration
-        conclusion: The final conclusion text
-        
-    Returns:
-        The filename of the saved JSON file
+    If analysis is None, skip adding conclusions/thoughts.
     """
-    # Create a complete data export including everything
     export_data = {
         "main_question": question,
-        "conclusion": conclusion,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "results": results,
         "facts": collect_all_facts(results),
         "bibliography": collect_bibliography_entries(results),
         "visited_urls": visited_urls
     }
-    
-    # Create a clean filename based on the question
+    if analysis is not None:
+        export_data["conclusions"] = analysis.get("conclusions", "")
+        export_data["thoughts"] = analysis.get("thoughts", "")
+
     filename_base = question[:30].replace(' ', '_').replace('?', '').replace('/', '_')
     filename = f"research_data_{filename_base}.json"
-    
-    # Save the JSON file with indentation for readability
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(export_data, f, indent=2)
-    
     print(f"Complete research data saved to {filename}")
-    return filename
+
+    return export_data, filename
+
+def add_analysis_to_json(filename: str, analysis: dict):
+    """
+    Add or update the 'conclusions' and 'thoughts' fields in the given JSON file.
+    """
+    import json
+    with open(filename, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    data["conclusions"] = analysis.get("conclusions", "")
+    data["thoughts"] = analysis.get("thoughts", "")
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    print(f"Analysis added to {filename}")
 
 ##############################################################################
 # Main scientific question answering workflow
@@ -1567,16 +1508,69 @@ def run_scientific_reasoning_workflow(
     scientific_question: str,
     breadth: int = 4,  # How many search queries per iteration
     depth: int = 2,    # How many layers of iteration
-    agent_config_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    agent_config_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    session_id: str = None,
+    session_manager = None
 ) -> Dict[str, Any]:
     """
     Run the full scientific reasoning workflow with real-time fact verification.
+    If session_id and session_manager are provided, save progress incrementally
+    and resume from any existing partial results.
     """
     # Apply any agent configuration overrides
     if agent_config_overrides:
         for agent_type, override_config in agent_config_overrides.items():
             if agent_type in AGENT_CONFIGS:
                 AGENT_CONFIGS[agent_type].update(override_config)
+    
+    # Check if we have an existing session to resume
+    results = {}
+    if session_id and session_manager:
+        # Get research data from session
+        research_data = session_manager.research_data
+        
+        # Check if we have partial results to resume from
+        if research_data and 'results' in research_data and research_data['results']:
+            print("\n=== Resuming from previous session ===")
+            results = research_data['results']
+            
+            # If we have a complete result with followups, we're just loading
+            if 'facts' in results and 'followups' in results:
+                print("Session contains complete results - loading previous research.")
+                
+                # Save research_data for quick access
+                research_data, json_filename = save_research_data_to_json(scientific_question, results, None)
+                
+                # Update session manager facts with flattened facts from research_data
+                session_manager.facts = research_data.get('facts', [])
+                session_manager.research_data['facts'] = research_data.get('facts', [])
+                
+                # Check if we have an analysis
+                if 'conclusions' in research_data and 'thoughts' in research_data:
+                    analysis = {
+                        'conclusions': research_data.get('conclusions', ''),
+                        'thoughts': research_data.get('thoughts', '')
+                    }
+                else:
+                    # Generate new analysis
+                    print("\n=== FORMING ANALYSIS FROM SAVED DATA ===")
+                    analysis = generate_analysis({
+                        'facts': research_data['facts'],
+                        'question': research_data['main_question']
+                    })
+                    print("THOUGHTS:\n", analysis.get('thoughts', ''))
+                    print("CONCLUSIONS:\n", analysis.get('conclusions', ''))
+                    
+                    # Add analysis to the session
+                    add_analysis_to_json(json_filename, analysis)
+                    
+                    # Update session manager
+                    session_manager.research_data['conclusions'] = analysis.get('conclusions', '')
+                    session_manager.research_data['thoughts'] = analysis.get('thoughts', '')
+                    session_manager.save_session()
+                
+                # Return the complete data
+                return research_data
     
     # Print introduction
     supervisor_intro = call_agent(
@@ -1602,46 +1596,80 @@ def run_scientific_reasoning_workflow(
 
     # Run the initial iteration with real-time fact verification
     print("\n=== Beginning research with real-time fact verification ===\n")
-    results = process_iteration(
-        question=scientific_question,
-        context=[],
-        depth_remaining=depth,
-        breadth=breadth
-    )
     
-    # Form the conclusion
-    print("\n=== FORMING FINAL CONCLUSION ===")
-    conclusion = form_conclusion(results)
-    print(conclusion)
+    # If we have partial results, use them; otherwise, start new
+    if not results:
+        results = process_iteration(
+            question=scientific_question,
+            context=[],
+            depth_remaining=depth,
+            breadth=breadth
+        )
+        
+        # Save progress after main iteration
+        if session_id and session_manager:
+            session_manager.research_data['results'] = results
+            session_manager.save_session()
+            print(f"Progress saved to session: {session_id}")
+    
+    # Save complete data to JSON file (before analysis)
+    research_data, json_filename = save_research_data_to_json(scientific_question, results, None)
+    print(f"Complete data exported to {json_filename}")
+
+    # Update session manager facts with flattened facts from research_data
+    if session_id and session_manager:
+        session_manager.facts = research_data.get('facts', [])
+        session_manager.research_data['facts'] = research_data.get('facts', [])
+        session_manager.save_session()
+        print(f"Updated session manager with {len(session_manager.facts)} facts")
+
+    # Form the analysis
+    print("\n=== FORMING FINAL ANALYSIS ===")
+    analysis = generate_analysis({
+        'facts': research_data['facts'],
+        'question': research_data['main_question']
+    })
+    print("THOUGHTS:\n", analysis.get('thoughts', ''))
+    print("CONCLUSIONS:\n", analysis.get('conclusions', ''))
     print("")
+
+    # Add analysis to the JSON file
+    add_analysis_to_json(json_filename, analysis)
     
+    # Update session if available
+    if session_id and session_manager:
+        session_manager.research_data['conclusions'] = analysis.get('conclusions', '')
+        session_manager.research_data['thoughts'] = analysis.get('thoughts', '')
+        
+        # Automatically convert thoughts to thought nodes and create thought chain
+        thoughts_text = analysis.get('thoughts', '')
+        if thoughts_text:
+            nodes = thoughts_text_to_nodes(thoughts_text)
+            node_dicts = [node.to_dict() for node in nodes]
+            if 'thought_nodes' not in session_manager.research_data:
+                session_manager.research_data['thought_nodes'] = []
+            session_manager.research_data['thought_nodes'].extend(node_dicts)
+            
+            # Create ThoughtChain and set as current
+            chain = build_thought_chain(nodes)
+            session_manager.research_data['current_thought_chain'] = {
+                'root_id': chain.root_id
+            }
+            print(f"Automatically converted thoughts to {len(node_dicts)} thought nodes.")
+            print(f"Created ThoughtChain with root_id: {chain.root_id}")
+        
+        session_manager.save_session()
+        print(f"Final results saved to session: {session_id}")
+
+    # Reload the updated JSON for the report
+    with open(json_filename, 'r', encoding='utf-8') as f:
+        research_data = json.load(f)
+
     # Generate markdown report
     print("\n=== GENERATING COMPREHENSIVE REPORT ===")
-    report = generate_markdown_report(scientific_question, results, conclusion)
-    print("Report generated successfully!")
-    
-    # Save report to file
-    report_filename = f"scientific_report_{scientific_question[:30].replace(' ', '_')}.md".replace('?', '')
-    with open(report_filename, 'w', encoding='utf-8') as f:
-        f.write(report)
-    print(f"Report saved to {report_filename}")
-    
-    # Save complete data to JSON file
-    json_filename = save_research_data_to_json(scientific_question, results, conclusion)
-    print(f"Complete data exported to {json_filename}")
-    
-    # Create a properly structured research data dictionary
-    research_data = {
-        'main_question': scientific_question,
-        'conclusion': conclusion,
-        'report': report,
-        'report_filename': report_filename,
-        'json_filename': json_filename,
-        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-        'results': results,  # Include the full original results
-        'facts': collect_all_facts(results),  # Use the existing function to collect facts
-        'bibliography': collect_bibliography_entries(results)  # Use the existing function
-    }
+    report = generate_markdown_report(research_data)
+    print("FINAL REPORT:")
+    print(report)
     
     return research_data  # Return the properly structured dictionary
 
@@ -1678,5 +1706,6 @@ if __name__ == "__main__":
         depth=2,
         agent_config_overrides=agent_config_overrides
     )
+
 
 

@@ -11,6 +11,7 @@ import numpy as np
 import time
 import hashlib
 import re
+import uuid
 
 # Import the core functions from your existing script
 from query_atom_smallworld import run_scientific_reasoning_workflow, SCIENTIFIC_RELATIONS, FIRECRAWL_CONFIG, R1_CONFIG, DEFAULT_CONFIG
@@ -18,6 +19,7 @@ from research_verification import FactVerifier
 from fact_manager import FactManager  # Import FactManager from fact_manager.py instead
 from research_session import SessionManager
 from fact_explorer import FactExplorer
+from thought_chain import ThoughtChain, ThoughtNode, extract_steps_from_text, thoughts_text_to_nodes, build_thought_chain
 
 class ResearchAssistantCLI(cmd.Cmd):
     """An interactive CLI for scientific research and knowledge management."""
@@ -82,37 +84,102 @@ class ResearchAssistantCLI(cmd.Cmd):
         """
         Start a new research process with the given query.
         Usage: research <your scientific question>
+           research -r SESSION_ID <your scientific question>  (to resume from a session)
+           research -r NUMBER <your scientific question>      (to resume by session number)
         """
         if not arg:
             print("Please provide a scientific question to research.")
             return
+        
+        # Check if this is a resume request
+        resume_session = False
+        session_id = None
+        
+        # Parse for resume flag
+        if arg.startswith('-r '):
+            parts = arg[3:].strip().split(' ', 1)
+            if len(parts) < 2:
+                print("Error: When using -r flag, specify both SESSION_ID/NUMBER and your question.")
+                print("Usage: research -r SESSION_ID your scientific question")
+                print("       research -r 2 your scientific question (to use session number)")
+                return
             
-        print(f"Researching: {arg}")
+            session_identifier = parts[0]
+            scientific_question = parts[1]
+            resume_session = True
+            
+            # Check if it's a number
+            try:
+                # If it's a number (like "2"), convert to session_id
+                idx = int(session_identifier) - 1
+                if 0 <= idx < len(self.session_manager.sessions):
+                    session_id = list(sorted(self.session_manager.sessions.keys()))[idx]
+                else:
+                    print(f"Invalid session number. Please specify a number between 1 and {len(self.session_manager.sessions)}.")
+                    # Show available sessions
+                    print("Available sessions:")
+                    for i, (sid, metadata) in enumerate(sorted(self.session_manager.sessions.items()), 1):
+                        print(f"{i}. {sid}: {metadata['question']} - {metadata['fact_count']} facts - {metadata['timestamp']}")
+                    return
+            except ValueError:
+                # Not a number, use as session_id
+                session_id = session_identifier
+            
+            # Verify the session exists
+            if session_id not in self.session_manager.sessions:
+                print(f"Error: Session {session_id} not found.")
+                available_sessions = list(self.session_manager.sessions.keys())
+                if available_sessions:
+                    print("Available sessions:")
+                    for i, sid in enumerate(available_sessions, 1):
+                        print(f"{i}. {sid}: {self.session_manager.sessions[sid].get('question', 'Unknown')}")
+                return
+            
+            print(f"Resuming research on '{scientific_question}' from session {session_id}")
+            # Load the session to resume
+            self._load_session(session_id)
+        else:
+            scientific_question = arg
+            print(f"Researching: {scientific_question}")
+            
+            # Create an initial session immediately to enable incremental saving
+            session_id = self.session_manager.create_session(scientific_question, {"main_question": scientific_question, "results": {}})
+            self._load_session(session_id)
+            print(f"Created session: {session_id}")
+        
         print("This may take a while depending on the complexity of the question...")
         
         try:
             # Import the research function
             from query_atom_smallworld import run_scientific_reasoning_workflow, DEFAULT_CONFIG
             
-            # Run the research process
-            result = run_scientific_reasoning_workflow(arg, agent_config_overrides=DEFAULT_CONFIG)
+            # Run the research process with the session_id for incremental saving
+            result = run_scientific_reasoning_workflow(
+                scientific_question, 
+                agent_config_overrides=DEFAULT_CONFIG,
+                session_id=session_id,
+                session_manager=self.session_manager
+            )
             
-            # Create a new session with the results
-            session_id = self.session_manager.create_session(arg, result)
+            # The session has already been updated incrementally, so we just load the final state
             self._load_session(session_id)
             
             # Print a summary
             print("\nResearch completed.")
-            print(f"Created session: {session_id}")
+            print(f"Session: {session_id}")
             print(f"Facts discovered: {len(self.facts)}")
             
             # Display the conclusion
-            if 'answer' in result.get('results', {}):
+            if 'conclusions' in result:
+                print("\nConclusion:")
+                print(result['conclusions'])
+            elif 'answer' in result.get('results', {}):
                 print("\nConclusion:")
                 print(result['results']['answer'])
             
         except Exception as e:
             print(f"Error during research: {str(e)}")
+            print(f"Session {session_id} has been saved. You can resume later using 'resume' or 'research -r {session_id} {scientific_question}'.")
     
     def do_load(self, arg):
         """
@@ -828,6 +895,818 @@ Example response format:
                 self.fact_explorer.print_filtered_facts(filtered_facts)
             else:
                 print("\nNo related facts found for query: " + arg)
+
+    def do_resume(self, arg):
+        """
+        Resume research on the current or specified session.
+        Usage: resume [session_number]
+               resume              (to resume current session)
+               resume 3            (to resume session number 3)
+        """
+        # Make sure we have sessions
+        if not self.session_manager.sessions:
+            print("No saved sessions found.")
+            return
+        
+        # Determine which session to use
+        session_id = None
+        
+        if not arg:
+            # Use current session if loaded
+            if self.current_session:
+                session_id = self.current_session
+            else:
+                print("No active session. Please specify a session number or load a session first.")
+                print("Available sessions:")
+                for i, (sid, metadata) in enumerate(sorted(self.session_manager.sessions.items()), 1):
+                    print(f"{i}. {sid}: {metadata['question']} - {metadata['fact_count']} facts - {metadata['timestamp']}")
+                return
+        else:
+            # Try to parse as session number
+            try:
+                idx = int(arg) - 1
+                if 0 <= idx < len(self.session_manager.sessions):
+                    session_id = list(sorted(self.session_manager.sessions.keys()))[idx]
+                else:
+                    print(f"Invalid session number. Please specify a number between 1 and {len(self.session_manager.sessions)}.")
+                    return
+            except ValueError:
+                print("Please provide a valid session number.")
+                return
+        
+        # Load the session if not already loaded
+        if self.current_session != session_id:
+            if not self._load_session(session_id):
+                print(f"Failed to load session {session_id}")
+                return
+        
+        # Get the question from the loaded session
+        scientific_question = self.research_data.get('main_question', '')
+        if not scientific_question:
+            print("Could not find the research question in the session data.")
+            return
+        
+        print(f"Resuming research on: {scientific_question}")
+        print("This may take a while depending on the complexity of the question...")
+        
+        try:
+            # Import the research function
+            from query_atom_smallworld import run_scientific_reasoning_workflow, DEFAULT_CONFIG
+            
+            # Run the research process with the session_id for incremental saving
+            result = run_scientific_reasoning_workflow(
+                scientific_question, 
+                agent_config_overrides=DEFAULT_CONFIG,
+                session_id=session_id,
+                session_manager=self.session_manager
+            )
+            
+            # The session has already been updated incrementally, so we just load the final state
+            self._load_session(session_id)
+            
+            # Print a summary
+            print("\nResearch completed.")
+            print(f"Session: {session_id}")
+            print(f"Facts discovered: {len(self.facts)}")
+            
+            # Display the conclusion
+            if 'conclusions' in result:
+                print("\nConclusion:")
+                print(result['conclusions'])
+            elif 'answer' in result.get('results', {}):
+                print("\nConclusion:")
+                print(result['results']['answer'])
+            
+        except Exception as e:
+            print(f"Error during research: {str(e)}")
+            print(f"Session {session_id} has been saved. You can resume later using 'resume' command.")
+
+    def do_convert_thoughts(self, arg):
+        """
+        Convert thoughts from research_data['thoughts'] (separated by double newlines) to ThoughtNode dicts and store in research_data['thought_nodes'].
+        Also creates a ThoughtChain and sets it as the current thought chain.
+        Usage: convert_thoughts
+        """
+        if 'thoughts' not in self.research_data or not self.research_data['thoughts']:
+            print("No thoughts found in research_data. Run research first to generate thoughts.")
+            return
+            
+        thoughts_text = self.research_data['thoughts']
+        nodes = thoughts_text_to_nodes(thoughts_text)
+        node_dicts = [node.to_dict() for node in nodes]
+        if 'thought_nodes' not in self.research_data:
+            self.research_data['thought_nodes'] = []
+        self.research_data['thought_nodes'].extend(node_dicts)
+        
+        # Create ThoughtChain and set as current
+        chain = build_thought_chain(nodes)
+        self.research_data['current_thought_chain'] = {
+            'root_id': chain.root_id
+        }
+        print(f"Added {len(node_dicts)} thought nodes to research_data['thought_nodes'].")
+        print(f"Created ThoughtChain with root_id: {chain.root_id}")
+        
+        # Save the session
+        self._save_session()
+        print("Session saved.")
+
+    def do_add_thoughtnode(self, arg):
+        """
+        Interactively add a single ThoughtNode to research_data['thought_nodes'].
+        Usage: add_thoughtnode
+        """
+        # Ensure the thought_nodes list exists
+        if 'thought_nodes' not in self.research_data:
+            self.research_data['thought_nodes'] = []
+        nodes = self.research_data['thought_nodes']
+
+        # List existing nodes
+        if nodes:
+            print("Existing ThoughtNodes:")
+            for i, node in enumerate(nodes, 1):
+                print(f"  {i}. {node['text'][:60]}{'...' if len(node['text']) > 60 else ''}")
+        else:
+            print("No existing ThoughtNodes. The new node will be a root node.")
+
+        # Prompt for parent node
+        parent_id = None
+        if nodes:
+            parent_input = input("Enter parent node number (or 'none' for root): ").strip()
+            if parent_input.lower() != 'none':
+                try:
+                    parent_index = int(parent_input) - 1
+                    if 0 <= parent_index < len(nodes):
+                        parent_id = nodes[parent_index]['id']
+                    else:
+                        print("Invalid parent number. Aborting.")
+                        return
+                except ValueError:
+                    print("Invalid parent number. Aborting.")
+                    return
+
+        # Prompt for node text
+        text = arg.strip() if arg else input("Enter text for the new thought node: ").strip()
+        if not text:
+            print("No text provided. Aborting.")
+            return
+
+        node_id = str(uuid.uuid4())
+        node = ThoughtNode(
+            id=node_id,
+            text=text,
+            parent_id=parent_id,
+            children_ids=[],
+            metadata={}
+        )
+        # Add to parent's children_ids if applicable
+        if parent_id:
+            for n in nodes:
+                if n['id'] == parent_id:
+                    # If parent already has children, remove them from the chain to maintain linearity
+                    existing_children = n.get('children_ids', [])
+                    if existing_children:
+                        print(f"Truncating chain: removing {len(existing_children)} existing children from chain structure.")
+                        # Remove existing children from chain (but keep in storage)
+                        for child_id in existing_children:
+                            for child_node in nodes:
+                                if child_node['id'] == child_id:
+                                    child_node['parent_id'] = None
+                                    child_node['children_ids'] = []
+                                    break
+                    
+                    # Set new node as the only child
+                    n['children_ids'] = [node_id]
+                    break
+        # Add new node
+        self.research_data['thought_nodes'].append(node.to_dict())
+        print(f"Added ThoughtNode (parent: {parent_input if parent_input.lower() != 'none' else 'none'})")
+        
+        # Save the session
+        self._save_session()
+
+    def do_edit_thoughtnode(self, arg):
+        """
+        Interactively edit the text of a ThoughtNode using numbered selection.
+        Usage: edit_thoughtnode
+        """
+        if 'thought_nodes' not in self.research_data or not self.research_data['thought_nodes']:
+            print("No thought nodes to edit.")
+            return
+        nodes = self.research_data['thought_nodes']
+        print("Available ThoughtNodes:")
+        for i, node in enumerate(nodes, 1):
+            print(f"  {i}. {node['text'][:80]}{'...' if len(node['text']) > 80 else ''}")
+        
+        try:
+            choice = input("Enter the number of the node to edit: ").strip()
+            node_index = int(choice) - 1
+            
+            if 0 <= node_index < len(nodes):
+                node = nodes[node_index]
+                print(f"\nCurrent text: {node['text']}")
+                new_text = input("Enter new text: ").strip()
+                if not new_text:
+                    print("No new text provided. Aborting.")
+                    return
+                
+                # Truncate chain after this node since we're changing the reasoning
+                existing_children = node.get('children_ids', [])
+                if existing_children:
+                    print(f"Truncating chain: removing {len(existing_children)} subsequent nodes from chain structure.")
+                    # Remove all children from chain (but keep in storage)
+                    for child_id in existing_children:
+                        for child_node in nodes:
+                            if child_node['id'] == child_id:
+                                child_node['parent_id'] = None
+                                child_node['children_ids'] = []
+                    # Clear this node's children
+                    node['children_ids'] = []
+                
+                node['text'] = new_text
+                print(f"Updated ThoughtNode {choice}.")
+                
+                # Save the session
+                self._save_session()
+            else:
+                print("Invalid number. Please select a valid node number.")
+        except ValueError:
+            print("Please enter a valid number.")
+
+    def do_view_thoughtchain(self, arg):
+        """
+        Display the current thought chain as an ASCII art flowchart with full text and numbered nodes.
+        Usage: view_thoughtchain
+        """
+        if 'current_thought_chain' not in self.research_data or not self.research_data['current_thought_chain']:
+            print("No current thought chain set.")
+            return
+        
+        root_id = self.research_data['current_thought_chain'].get('root_id')
+        if not root_id:
+            print("No root_id in current thought chain.")
+            return
+            
+        if 'thought_nodes' not in self.research_data or not self.research_data['thought_nodes']:
+            print("No thought nodes available.")
+            return
+            
+        # Create a lookup dict for nodes and number mapping
+        nodes_dict = {node['id']: node for node in self.research_data['thought_nodes']}
+        
+        # Create number mapping (1-based indexing)
+        id_to_number = {}
+        for i, node in enumerate(self.research_data['thought_nodes']):
+            id_to_number[node['id']] = i + 1
+        
+        if root_id not in nodes_dict:
+            print(f"Root node {root_id} not found in thought nodes.")
+            return
+            
+        print("Current ThoughtChain Flowchart:")
+        print("=" * 120)
+        self._display_flowchart(root_id, nodes_dict, id_to_number)
+    
+    def _display_flowchart(self, root_id, nodes_dict, id_to_number):
+        """Display the thought chain as ASCII art flowchart."""
+        # Get the layout of all nodes
+        layout = self._calculate_layout(root_id, nodes_dict)
+        
+        # Render the flowchart
+        self._render_flowchart(layout, nodes_dict, id_to_number)
+    
+    def _calculate_layout(self, node_id, nodes_dict, x=0, y=0, visited=None):
+        """Calculate positions for all nodes in the flowchart."""
+        if visited is None:
+            visited = set()
+        
+        if node_id in visited or node_id not in nodes_dict:
+            return {}
+        
+        visited.add(node_id)
+        node = nodes_dict[node_id]
+        
+        layout = {node_id: {'x': x, 'y': y, 'node': node}}
+        
+        children = node.get('children_ids', [])
+        if children:
+            # Calculate spacing for children based on text width - increase spacing
+            child_spacing = max(6, len(children) * 3)
+            start_x = x - (len(children) - 1) * child_spacing // 2
+            
+            for i, child_id in enumerate(children):
+                child_x = start_x + i * child_spacing
+                child_layout = self._calculate_layout(child_id, nodes_dict, child_x, y + 2, visited)
+                layout.update(child_layout)
+        
+        return layout
+    
+    def _render_flowchart(self, layout, nodes_dict, id_to_number):
+        """Render the flowchart as ASCII art."""
+        if not layout:
+            return
+        
+        # Find bounds
+        min_x = min(pos['x'] for pos in layout.values())
+        max_x = max(pos['x'] for pos in layout.values())
+        min_y = min(pos['y'] for pos in layout.values())
+        max_y = max(pos['y'] for pos in layout.values())
+        
+        # Adjust coordinates to be positive
+        for pos in layout.values():
+            pos['x'] -= min_x
+            pos['y'] -= min_y
+        
+        # Calculate max text width for proper grid sizing
+        max_text_width = 0
+        for node_id, pos in layout.items():
+            text = pos['node']['text']
+            max_text_width = max(max_text_width, len(text))
+        
+        # Ensure minimum width for readability
+        box_width = max(30, min(80, max_text_width + 4))
+        
+        # Create grid with dynamic sizing - increase spacing
+        width = (max_x - min_x + 1) * (box_width + 15) + 30
+        height = (max_y - min_y + 1) * 10 + 15
+        grid = [[' ' for _ in range(width)] for _ in range(height)]
+        
+        # Draw nodes and connections
+        for node_id, pos in layout.items():
+            self._draw_node(grid, pos, node_id, id_to_number, box_width)
+            self._draw_connections(grid, pos, nodes_dict, layout, box_width)
+        
+        # Print the grid
+        for row in grid:
+            print(''.join(row).rstrip())
+    
+    def _draw_node(self, grid, pos, node_id, id_to_number, box_width):
+        """Draw a single node box with full text."""
+        node = pos['node']
+        text = node['text']
+        node_number = id_to_number.get(node_id, '?')
+        
+        # Wrap text to fit in box but show full text
+        lines = []
+        words = text.split()
+        current_line = ""
+        
+        for word in words:
+            if len(current_line + " " + word) <= box_width - 2:
+                current_line += (" " + word) if current_line else word
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+        
+        # Calculate box position and size
+        box_height = len(lines) + 4  # Extra space for borders and number
+        start_x = pos['x'] * (box_width + 15)
+        start_y = pos['y'] * 10
+        
+        # Draw box
+        try:
+            # Top border
+            for i in range(box_width):
+                if start_y < len(grid) and start_x + i < len(grid[0]):
+                    grid[start_y][start_x + i] = '─' if i > 0 and i < box_width - 1 else ('┌' if i == 0 else '┐')
+            
+            # Node number line
+            number_text = f"Node {node_number}"
+            if start_y + 1 < len(grid):
+                if start_x < len(grid[0]):
+                    grid[start_y + 1][start_x] = '│'
+                if start_x + box_width - 1 < len(grid[0]):
+                    grid[start_y + 1][start_x + box_width - 1] = '│'
+                
+                # Center the number
+                padding = (box_width - 2 - len(number_text)) // 2
+                for j, char in enumerate(number_text):
+                    if start_x + 1 + padding + j < len(grid[0]):
+                        grid[start_y + 1][start_x + 1 + padding + j] = char
+            
+            # Separator line
+            if start_y + 2 < len(grid):
+                for i in range(box_width):
+                    if start_x + i < len(grid[0]):
+                        grid[start_y + 2][start_x + i] = '─' if i > 0 and i < box_width - 1 else ('├' if i == 0 else '┤')
+            
+            # Text content
+            for i, line in enumerate(lines):
+                row_y = start_y + 3 + i
+                if row_y < len(grid):
+                    if start_x < len(grid[0]):
+                        grid[row_y][start_x] = '│'
+                    if start_x + box_width - 1 < len(grid[0]):
+                        grid[row_y][start_x + box_width - 1] = '│'
+                    
+                    # Add text
+                    for j, char in enumerate(line):
+                        if start_x + 1 + j < len(grid[0]):
+                            grid[row_y][start_x + 1 + j] = char
+            
+            # Bottom border
+            bottom_y = start_y + 3 + len(lines)
+            if bottom_y < len(grid):
+                for i in range(box_width):
+                    if start_x + i < len(grid[0]):
+                        grid[bottom_y][start_x + i] = '─' if i > 0 and i < box_width - 1 else ('└' if i == 0 else '┘')
+        
+        except IndexError:
+            pass  # Skip if out of bounds
+    
+    def _draw_connections(self, grid, pos, nodes_dict, layout, box_width):
+        """Draw connections from this node to its children."""
+        node = pos['node']
+        children = node.get('children_ids', [])
+        
+        if not children:
+            return
+        
+        # Calculate connection points
+        parent_x = pos['x'] * (box_width + 15) + box_width // 2
+        text_lines = len(node['text'].split('\n')) if '\n' in node['text'] else len([line for line in [node['text'][i:i+box_width-2] for i in range(0, len(node['text']), box_width-2)] if line])
+        parent_y = pos['y'] * 10 + 4 + max(1, text_lines) + 2
+        
+        try:
+            # Draw vertical line down from parent
+            if parent_y < len(grid) and parent_x < len(grid[0]):
+                grid[parent_y][parent_x] = '│'
+            
+            if len(children) == 1:
+                # Single child - straight line
+                child_pos = layout.get(children[0])
+                if child_pos:
+                    child_x = child_pos['x'] * (box_width + 15) + box_width // 2
+                    child_y = child_pos['y'] * 10
+                    
+                    # Draw vertical line to child
+                    for y in range(parent_y + 1, child_y):
+                        if y < len(grid) and parent_x < len(grid[0]):
+                            grid[y][parent_x] = '│'
+                    
+                    # Draw arrow to child
+                    if child_y - 1 < len(grid) and child_x < len(grid[0]):
+                        grid[child_y - 1][child_x] = '▼'
+            
+            elif len(children) > 1:
+                # Multiple children - horizontal distribution
+                child_positions = []
+                for child_id in children:
+                    if child_id in layout:
+                        child_pos = layout[child_id]
+                        child_x = child_pos['x'] * (box_width + 15) + box_width // 2
+                        child_y = child_pos['y'] * 10
+                        child_positions.append((child_x, child_y))
+                
+                if child_positions:
+                    # Draw horizontal line
+                    min_child_x = min(x for x, y in child_positions)
+                    max_child_x = max(x for x, y in child_positions)
+                    horizontal_y = parent_y + 1
+                    
+                    if horizontal_y < len(grid):
+                        for x in range(min_child_x, max_child_x + 1):
+                            if x < len(grid[0]):
+                                grid[horizontal_y][x] = '─'
+                        
+                        # Draw vertical lines to each child
+                        for child_x, child_y in child_positions:
+                            # Connect to horizontal line
+                            if parent_x < len(grid[0]):
+                                grid[horizontal_y][parent_x] = '┬'
+                            if child_x < len(grid[0]):
+                                grid[horizontal_y][child_x] = '┬'
+                            
+                            # Draw down to child
+                            for y in range(horizontal_y + 1, child_y):
+                                if y < len(grid) and child_x < len(grid[0]):
+                                    grid[y][child_x] = '│'
+                            
+                            # Draw arrow
+                            if child_y - 1 < len(grid) and child_x < len(grid[0]):
+                                grid[child_y - 1][child_x] = '▼'
+        
+        except IndexError:
+            pass  # Skip if out of bounds
+
+    def do_move_thoughtnode(self, arg):
+        """
+        Move a thought node (and its subtree) to a new parent in the current thought chain.
+        Usage: move_thoughtnode
+        """
+        if 'current_thought_chain' not in self.research_data or not self.research_data['current_thought_chain']:
+            print("No current thought chain set.")
+            return
+            
+        if 'thought_nodes' not in self.research_data or not self.research_data['thought_nodes']:
+            print("No thought nodes available.")
+            return
+            
+        nodes = self.research_data['thought_nodes']
+        nodes_dict = {node['id']: node for node in nodes}
+        
+        print("Current ThoughtNodes:")
+        for i, node in enumerate(nodes, 1):
+            print(f"  {i}. {node['text'][:50]}{'...' if len(node['text']) > 50 else ''}")
+        
+        try:
+            choice = input("Enter the number of the node to move: ").strip()
+            node_index = int(choice) - 1
+            
+            if not (0 <= node_index < len(nodes)):
+                print("Invalid node number.")
+                return
+                
+            node_id = nodes[node_index]['id']
+            
+            print("Available parent nodes (or 'none' for root):")
+            for i, node in enumerate(nodes, 1):
+                if i != int(choice):  # Can't be parent of itself
+                    print(f"  {i}. {node['text'][:50]}{'...' if len(node['text']) > 50 else ''}")
+            
+            parent_choice = input("Enter new parent number (or 'none' for root): ").strip()
+            if parent_choice.lower() == 'none':
+                new_parent_id = None
+            else:
+                try:
+                    parent_index = int(parent_choice) - 1
+                    if 0 <= parent_index < len(nodes) and parent_index != node_index:
+                        new_parent_id = nodes[parent_index]['id']
+                    else:
+                        print("Invalid parent number.")
+                        return
+                except ValueError:
+                    print("Invalid parent number.")
+                    return
+                    
+            # Update the node's parent
+            node = nodes_dict[node_id]
+            old_parent_id = node.get('parent_id')
+            
+            # Remove from old parent's children
+            if old_parent_id and old_parent_id in nodes_dict:
+                old_parent = nodes_dict[old_parent_id]
+                if node_id in old_parent.get('children_ids', []):
+                    old_parent['children_ids'].remove(node_id)
+            
+            # Set new parent
+            node['parent_id'] = new_parent_id
+            
+            # Add to new parent's children
+            if new_parent_id and new_parent_id in nodes_dict:
+                new_parent = nodes_dict[new_parent_id]
+                if 'children_ids' not in new_parent:
+                    new_parent['children_ids'] = []
+                if node_id not in new_parent['children_ids']:
+                    new_parent['children_ids'].append(node_id)
+            
+            print(f"Moved node {choice} to parent {parent_choice}")
+            
+            # Save the session
+            self._save_session()
+            
+        except ValueError:
+            print("Please enter a valid number.")
+
+    def do_remove_thoughtnode(self, arg):
+        """
+        Remove a thought node from the current thought chain structure (but keep in thought_nodes).
+        Usage: remove_thoughtnode
+        """
+        if 'current_thought_chain' not in self.research_data or not self.research_data['current_thought_chain']:
+            print("No current thought chain set.")
+            return
+            
+        if 'thought_nodes' not in self.research_data or not self.research_data['thought_nodes']:
+            print("No thought nodes available.")
+            return
+            
+        nodes = self.research_data['thought_nodes']
+        nodes_dict = {node['id']: node for node in nodes}
+        
+        print("Current ThoughtNodes:")
+        for i, node in enumerate(nodes, 1):
+            print(f"  {i}. {node['text'][:50]}{'...' if len(node['text']) > 50 else ''}")
+        
+        try:
+            choice = input("Enter the number of the node to remove from chain: ").strip()
+            node_index = int(choice) - 1
+            
+            if not (0 <= node_index < len(nodes)):
+                print("Invalid node number.")
+                return
+                
+            node_id = nodes[node_index]['id']
+            node = nodes_dict[node_id]
+            children_ids = node.get('children_ids', [])
+            
+            # Handle children if any
+            if children_ids:
+                print(f"This node has {len(children_ids)} children. What should happen to them?")
+                print("1. Remove them from chain too")
+                print("2. Re-parent them to this node's parent")
+                child_choice = input("Enter choice (1 or 2): ").strip()
+                
+                if child_choice == "1":
+                    # Remove children from chain recursively
+                    for child_id in children_ids:
+                        if child_id in nodes_dict:
+                            nodes_dict[child_id]['parent_id'] = None
+                            nodes_dict[child_id]['children_ids'] = []
+                elif child_choice == "2":
+                    # Re-parent children to this node's parent
+                    new_parent_id = node.get('parent_id')
+                    for child_id in children_ids:
+                        if child_id in nodes_dict:
+                            nodes_dict[child_id]['parent_id'] = new_parent_id
+                            # Add to new parent's children if new parent exists
+                            if new_parent_id and new_parent_id in nodes_dict:
+                                new_parent = nodes_dict[new_parent_id]
+                                if 'children_ids' not in new_parent:
+                                    new_parent['children_ids'] = []
+                                if child_id not in new_parent['children_ids']:
+                                    new_parent['children_ids'].append(child_id)
+                else:
+                    print("Invalid choice. Aborting.")
+                    return
+            
+            # Remove from parent's children
+            parent_id = node.get('parent_id')
+            if parent_id and parent_id in nodes_dict:
+                parent = nodes_dict[parent_id]
+                if node_id in parent.get('children_ids', []):
+                    parent['children_ids'].remove(node_id)
+            
+            # Clear this node's relationships but keep the node
+            node['parent_id'] = None
+            node['children_ids'] = []
+            
+            print(f"Removed node {choice} from thought chain structure.")
+            
+            # Save the session
+            self._save_session()
+            
+        except ValueError:
+            print("Please enter a valid number.")
+
+    def do_set_current_chain(self, arg):
+        """
+        Set which node should be the root of the current thought chain.
+        Usage: set_current_chain
+        """
+        if 'thought_nodes' not in self.research_data or not self.research_data['thought_nodes']:
+            print("No thought nodes available.")
+            return
+            
+        nodes = self.research_data['thought_nodes']
+        
+        # Find potential root nodes (nodes with no parent)
+        root_candidates = [node for node in nodes if node.get('parent_id') is None]
+        
+        if not root_candidates:
+            print("No potential root nodes found (all nodes have parents).")
+            return
+            
+        print("Available root node candidates:")
+        for i, node in enumerate(root_candidates, 1):
+            print(f"  {i}. {node['text'][:50]}{'...' if len(node['text']) > 50 else ''}")
+        
+        try:
+            choice = input("Enter the number of the node to set as current chain root: ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(root_candidates):
+                selected_node = root_candidates[idx]
+                if 'current_thought_chain' not in self.research_data:
+                    self.research_data['current_thought_chain'] = {}
+                self.research_data['current_thought_chain']['root_id'] = selected_node['id']
+                print(f"Set current thought chain root to node {choice}.")
+                
+                # Save the session
+                self._save_session()
+            else:
+                print("Invalid selection.")
+        except ValueError:
+            print("Please enter a valid number.")
+
+    def do_continue_reasoning(self, arg):
+        """
+        Convert the current thought chain to text and send it to deepseek-V3 for continued reasoning.
+        Usage: continue_reasoning [additional_context]
+        """
+        if 'current_thought_chain' not in self.research_data or not self.research_data['current_thought_chain']:
+            print("No current thought chain set. Use 'set_current_chain' first.")
+            return
+            
+        root_id = self.research_data['current_thought_chain'].get('root_id')
+        if not root_id:
+            print("No root_id in current thought chain.")
+            return
+            
+        if 'thought_nodes' not in self.research_data or not self.research_data['thought_nodes']:
+            print("No thought nodes available.")
+            return
+            
+        # Create nodes dictionary
+        nodes_dict = {node['id']: node for node in self.research_data['thought_nodes']}
+        
+        if root_id not in nodes_dict:
+            print(f"Root node {root_id} not found in thought nodes.")
+            return
+        
+        # Convert thought chain to text
+        from thought_chain import thoughtchain_to_text
+        chain_text = thoughtchain_to_text(nodes_dict, root_id)
+        
+        if not chain_text:
+            print("No text could be extracted from the thought chain.")
+            return
+        
+        # Prepare the prompt
+        additional_context = arg.strip() if arg else ""
+        
+        main_question = self.research_data.get('main_question', 'the research question')
+        
+        if additional_context:
+            prompt = f"""Your job is to continue the reasoning chain with one additional thought. Do not add more than one thought.
+            Follow the chain of thought and add your next thought. Do not add any other text. 
+            Keep the length of the thought to be of similar length to the prior thoughts.
+            
+            User: {main_question}
+
+            Useful information: 
+            {additional_context}
+
+            Prior Thoughts:
+            {chain_text}
+        """
+            
+        else:
+            prompt = f"""Your job is to continue the reasoning chain with one additional thought. Do not add more than one thought.
+            Follow the chain of thought and add your next thought. Do not add any other text. 
+            Keep the length of the thought to be of similar length to the prior thoughts.
+            
+            User: {main_question}
+
+            Prior Thoughts:
+            {chain_text}
+        """
+        
+        print("Sending thought chain to deepseek-V3 for continued reasoning...")
+        print(f"Chain length: {len(chain_text)} characters")
+        
+        try:
+            # Import required modules
+            from query_atom_smallworld import call_agent
+            
+            # Call the reasoning_continuation agent
+            response = call_agent(
+                agent_type="reasoning_continuation",
+                user_prompt=prompt
+            )
+            
+            print("\n" + "="*80)
+            print("CONTINUED REASONING:")
+            print("="*80)
+            print(response)
+            print("="*80)
+            
+            # Optionally add the continued reasoning as new nodes
+            add_to_chain = input("\nAdd this continued reasoning to the thought chain? (y/n): ").strip().lower()
+            if add_to_chain == 'y':
+                # Convert the response to new thought nodes and add to chain
+                from thought_chain import thoughts_text_to_nodes
+                new_nodes = thoughts_text_to_nodes(response)
+                
+                if new_nodes:
+                    # Find the last node in the current chain
+                    current_id = root_id
+                    while current_id is not None:
+                        node = nodes_dict[current_id]
+                        children = node.get('children_ids', [])
+                        if children:
+                            current_id = children[0]  # Follow the chain
+                        else:
+                            break  # Found the end
+                    
+                    # Connect first new node to the end of current chain
+                    if current_id and new_nodes:
+                        first_new_node = new_nodes[0]
+                        first_new_node.parent_id = current_id
+                        nodes_dict[current_id]['children_ids'] = [first_new_node.id]
+                    
+                    # Add all new nodes to the research data
+                    for node in new_nodes:
+                        self.research_data['thought_nodes'].append(node.to_dict())
+                    
+                    print(f"Added {len(new_nodes)} new reasoning nodes to the thought chain.")
+                    self._save_session()
+                else:
+                    print("Could not parse the continued reasoning into thought nodes.")
+            
+        except Exception as e:
+            print(f"Error during reasoning continuation: {str(e)}")
 
 if __name__ == "__main__":
     # Import necessary variables/functions from query_atom_smallworld
